@@ -449,18 +449,212 @@ function createBazookaViewModel() {
 const CELL_SIZE = 18;
 const WALL_HEIGHT = 42;
 
-// 9x9 Grid maze with strategic open parkour corridors and vertical escape beacon at the NE corner
+// 13x13 maze (1 = wall, 0 = corridor, 2 = spawn, 3 = exit). Several loops, so there is more than one route.
+// Fixed layout so every pilot in a lobby runs the same maze.
 const MAZE_GRID = [
-  [1, 1, 1, 1, 1, 1, 1, 1, 1],
-  [1, 2, 0, 0, 1, 0, 0, 0, 1],
-  [1, 0, 1, 0, 1, 0, 1, 0, 1],
-  [1, 0, 1, 0, 0, 0, 1, 0, 1],
-  [1, 0, 1, 1, 0, 1, 1, 0, 1],
-  [1, 0, 0, 0, 0, 0, 1, 0, 1],
-  [1, 1, 1, 0, 1, 0, 1, 0, 1],
-  [1, 0, 0, 0, 1, 0, 0, 3, 1],
-  [1, 1, 1, 1, 1, 1, 1, 1, 1],
+  [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+  [1, 2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1],
+  [1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 1],
+  [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1],
+  [1, 0, 1, 0, 1, 1, 0, 1, 1, 0, 1, 0, 1],
+  [1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1],
+  [1, 1, 1, 0, 1, 0, 1, 0, 1, 0, 1, 1, 1],
+  [1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1],
+  [1, 0, 1, 1, 1, 0, 1, 0, 1, 1, 1, 0, 1],
+  [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1],
+  [1, 0, 1, 1, 0, 1, 1, 1, 0, 1, 1, 0, 1],
+  [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 3, 1],
+  [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
 ];
+
+// ==========================================
+// ANGLED MAZE WALLS (convex prisms instead of grid-aligned boxes)
+// ==========================================
+const WALL_CHAMFER = 5; // cut off exposed outer corners of wall blocks
+const CORNER_FILL = 6; // angled fill in the inside corners of turns
+
+// Outward edge normals + bounds, so collision checks are cheap
+function makePrism(verts, minY, maxY) {
+  // Same winding for every outline (NW -> NE -> SE -> SW order), so faces point outwards
+  let area = 0;
+  verts.forEach((a, i) => {
+    const b = verts[(i + 1) % verts.length];
+    area += a.x * b.z - b.x * a.z;
+  });
+  if (area < 0) verts = [...verts].reverse();
+  const cx = verts.reduce((s, v) => s + v.x, 0) / verts.length;
+  const cz = verts.reduce((s, v) => s + v.z, 0) / verts.length;
+  const edges = verts.map((a, i) => {
+    const b = verts[(i + 1) % verts.length];
+    let nx = b.z - a.z;
+    let nz = -(b.x - a.x);
+    const len = Math.hypot(nx, nz);
+    nx /= len;
+    nz /= len;
+    if (nx * (a.x - cx) + nz * (a.z - cz) < 0) {
+      nx = -nx;
+      nz = -nz;
+    }
+    return { a, b, nx, nz, d: nx * a.x + nz * a.z };
+  });
+  return {
+    verts,
+    edges,
+    minY,
+    maxY,
+    minX: Math.min(...verts.map((v) => v.x)),
+    maxX: Math.max(...verts.map((v) => v.x)),
+    minZ: Math.min(...verts.map((v) => v.z)),
+    maxZ: Math.max(...verts.map((v) => v.z)),
+  };
+}
+
+// Signed distance from point (px, pz) to the prism outline (negative = inside),
+// plus the direction to push out along. Returns null when farther than maxDist.
+function prismContact(prism, px, pz, maxDist) {
+  if (
+    px < prism.minX - maxDist ||
+    px > prism.maxX + maxDist ||
+    pz < prism.minZ - maxDist ||
+    pz > prism.maxZ + maxDist
+  ) {
+    return null;
+  }
+  let best = -Infinity;
+  let bestEdge = null;
+  for (const e of prism.edges) {
+    const s = e.nx * px + e.nz * pz - e.d;
+    if (s > best) {
+      best = s;
+      bestEdge = e;
+    }
+  }
+  if (best <= 0) return { dist: best, nx: bestEdge.nx, nz: bestEdge.nz };
+
+  // Outside: nearest point on the outline
+  let minD = Infinity;
+  let nx = 0;
+  let nz = 0;
+  for (const e of prism.edges) {
+    const ex = e.b.x - e.a.x;
+    const ez = e.b.z - e.a.z;
+    const tt = Math.max(0, Math.min(1, ((px - e.a.x) * ex + (pz - e.a.z) * ez) / (ex * ex + ez * ez)));
+    const qx = e.a.x + ex * tt;
+    const qz = e.a.z + ez * tt;
+    const d = Math.hypot(px - qx, pz - qz);
+    if (d < minD) {
+      minD = d;
+      if (d > 1e-6) {
+        nx = (px - qx) / d;
+        nz = (pz - qz) / d;
+      } else {
+        nx = e.nx;
+        nz = e.nz;
+      }
+    }
+  }
+  if (minD > maxDist) return null;
+  return { dist: minD, nx, nz };
+}
+
+// Wall blocks with chamfered outer corners, plus angled fills in inside corners
+function buildMazeWallPrisms(grid, cellSize, offsetX, offsetZ, minY, maxY) {
+  const isWall = (r, c) => r < 0 || c < 0 || r >= grid.length || c >= grid[0].length || grid[r][c] === 1;
+  // Corners in order NW, NE, SE, SW: [dx, dz] sign and the neighbour offsets that touch them
+  const corners = [
+    { sx: 0, sz: 0, a: [-1, 0], b: [0, -1], diag: [-1, -1], inX: 1, inZ: 1 },
+    { sx: 1, sz: 0, a: [-1, 0], b: [0, 1], diag: [-1, 1], inX: -1, inZ: 1 },
+    { sx: 1, sz: 1, a: [1, 0], b: [0, 1], diag: [1, 1], inX: -1, inZ: -1 },
+    { sx: 0, sz: 1, a: [1, 0], b: [0, -1], diag: [1, -1], inX: 1, inZ: -1 },
+  ];
+  const prisms = [];
+  for (let r = 0; r < grid.length; r++) {
+    for (let c = 0; c < grid[0].length; c++) {
+      const x0 = offsetX + c * cellSize;
+      const z0 = offsetZ + r * cellSize;
+      if (grid[r][c] === 1) {
+        const verts = [];
+        corners.forEach((k, i) => {
+          const x = x0 + k.sx * cellSize;
+          const z = z0 + k.sz * cellSize;
+          const exposed =
+            !isWall(r + k.a[0], c + k.a[1]) && !isWall(r + k.b[0], c + k.b[1]) && !isWall(r + k.diag[0], c + k.diag[1]);
+          if (!exposed) {
+            verts.push({ x, z });
+            return;
+          }
+          // Two points replace the corner; keep the outline going clockwise (NW -> NE -> SE -> SW)
+          const alongX = { x: x + k.inX * WALL_CHAMFER, z };
+          const alongZ = { x, z: z + k.inZ * WALL_CHAMFER };
+          if (i % 2 === 0) verts.push(alongZ, alongX);
+          else verts.push(alongX, alongZ);
+        });
+        prisms.push(makePrism(verts, minY, maxY));
+      } else {
+        // Open cell: fill each inside corner where two walls meet at a right angle
+        corners.forEach((k) => {
+          if (!isWall(r + k.a[0], c + k.a[1]) || !isWall(r + k.b[0], c + k.b[1])) return;
+          const x = x0 + k.sx * cellSize;
+          const z = z0 + k.sz * cellSize;
+          prisms.push(
+            makePrism(
+              [
+                { x, z },
+                { x: x + k.inX * CORNER_FILL, z },
+                { x, z: z + k.inZ * CORNER_FILL },
+              ],
+              minY,
+              maxY
+            )
+          );
+        });
+      }
+    }
+  }
+  return prisms;
+}
+
+// Pushes a convex outline outwards by `dist` (used for the neon trim strips)
+function offsetOutline(prism, dist) {
+  const n = prism.edges.length;
+  return prism.verts.map((v, i) => {
+    const e1 = prism.edges[(i - 1 + n) % n];
+    const e2 = prism.edges[i];
+    const k = dist / (1 + e1.nx * e2.nx + e1.nz * e2.nz);
+    return { x: v.x + (e1.nx + e2.nx) * k, z: v.z + (e1.nz + e2.nz) * k };
+  });
+}
+
+// Side walls + top cap for a vertical prism, UVs in world units so textures don't stretch
+function buildPrismGeometry(verts, y0, y1, uSize, vSize) {
+  const pos = [];
+  const uv = [];
+  let run = 0;
+  for (let i = 0; i < verts.length; i++) {
+    const a = verts[i];
+    const b = verts[(i + 1) % verts.length];
+    const len = Math.hypot(b.x - a.x, b.z - a.z);
+    const u0 = run / uSize;
+    const u1 = (run + len) / uSize;
+    run += len;
+    const v0 = y0 / vSize;
+    const v1 = y1 / vSize;
+    pos.push(a.x, y0, a.z, b.x, y1, b.z, b.x, y0, b.z, a.x, y0, a.z, a.x, y1, a.z, b.x, y1, b.z);
+    uv.push(u0, v0, u1, v1, u1, v0, u0, v0, u0, v1, u1, v1);
+  }
+  for (let i = 1; i < verts.length - 1; i++) {
+    const p = [verts[0], verts[i + 1], verts[i]];
+    p.forEach((v) => {
+      pos.push(v.x, y1, v.z);
+      uv.push(v.x / uSize, v.z / uSize);
+    });
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  geo.computeVertexNormals();
+  return geo;
+}
 
 // Generate procedural high-tech grid textures for walls and boost pads
 function createGridTexture(bg, lineColor, accentColor) {
@@ -668,11 +862,12 @@ export default function App() {
       KeyC: false,
     },
     lavaY: -4.2,
-    lavaBaseSpeed: 0.48,
+    lavaBaseSpeed: 0.31, // tuned for the 13x13 maze (shortest route 20 cells)
     elapsedTime: 0,
     exitPos: new THREE.Vector3(),
     spawnPos: new THREE.Vector3(),
     staticColliders: [],
+    wallPrisms: [],
     risingPlatforms: [],
     nextPlatformSpawnTimer: 1.5,
     enemies: [],
@@ -1026,6 +1221,7 @@ export default function App() {
     // 3. Build Labyrinth Geometry & Wall-Clinging Cyborgs
     const g = gameRef.current;
     g.staticColliders = [];
+    g.wallPrisms = [];
     g.risingPlatforms = [];
     g.enemies = [];
     g.rockets = [];
@@ -1033,7 +1229,7 @@ export default function App() {
     g.shatterDebris = [];
 
     const wallTex = createGridTexture('#131824', '#26324d', '#38bdf8');
-    wallTex.repeat.set(2, 5);
+    wallTex.repeat.set(1, 1); // wall UVs are in world units (one tile = 9 x 8.4)
     const wallMat = new THREE.MeshStandardMaterial({
       map: wallTex,
       roughness: 0.45,
@@ -1058,7 +1254,6 @@ export default function App() {
     const offsetX = -(cols * CELL_SIZE) / 2;
     const offsetZ = -(rows * CELL_SIZE) / 2;
 
-    const wallGeo = new THREE.BoxGeometry(CELL_SIZE, WALL_HEIGHT, CELL_SIZE);
     const openCorridorCells = [];
 
     for (let r = 0; r < rows; r++) {
@@ -1067,33 +1262,7 @@ export default function App() {
         const cx = offsetX + c * CELL_SIZE + CELL_SIZE / 2;
         const cz = offsetZ + r * CELL_SIZE + CELL_SIZE / 2;
 
-        if (cell === 1) {
-          // Maze Wall Block
-          const wallMesh = new THREE.Mesh(wallGeo, wallMat);
-          wallMesh.position.set(cx, WALL_HEIGHT / 2 - 6, cz);
-          scene.add(wallMesh);
-
-          // Glowing Neon Guide Strips along Wall Run Height
-          const stripGeo = new THREE.BoxGeometry(CELL_SIZE + 0.12, 0.35, CELL_SIZE + 0.12);
-          const strip1 = new THREE.Mesh(stripGeo, trimMat);
-          strip1.position.set(cx, 6.5, cz);
-          scene.add(strip1);
-
-          const strip2 = new THREE.Mesh(stripGeo, trimMat);
-          strip2.position.set(cx, 16.5, cz);
-          scene.add(strip2);
-
-          g.staticColliders.push({
-            minX: cx - CELL_SIZE / 2,
-            maxX: cx + CELL_SIZE / 2,
-            minY: -6,
-            maxY: WALL_HEIGHT - 6,
-            minZ: cz - CELL_SIZE / 2,
-            maxZ: cz + CELL_SIZE / 2,
-            isSlidePad: false,
-            isExit: false,
-          });
-        } else if (cell === 2) {
+        if (cell === 2) {
           // Spawn Starting Pad
           const platH = 9;
           const platMesh = new THREE.Mesh(new THREE.BoxGeometry(8, platH, 8), startPlatMat);
@@ -1165,6 +1334,16 @@ export default function App() {
       }
     }
 
+    // Angled maze walls: chamfered blocks + inside-corner fills, with neon trim strips
+    g.wallPrisms = buildMazeWallPrisms(MAZE_GRID, CELL_SIZE, offsetX, offsetZ, -6, WALL_HEIGHT - 6);
+    g.wallPrisms.forEach((prism) => {
+      scene.add(new THREE.Mesh(buildPrismGeometry(prism.verts, -6, WALL_HEIGHT - 6, 9, 8.4), wallMat));
+      const trimOutline = offsetOutline(prism, 0.06);
+      [6.5, 16.5].forEach((y) => {
+        scene.add(new THREE.Mesh(buildPrismGeometry(trimOutline, y - 0.175, y + 0.175, 1, 1), trimMat));
+      });
+    });
+
     // 4. Spawn Wall-Clinging Cyborg Enemies (White Hoodies, Black Pants, White Sneakers)
     openCorridorCells.forEach((cell, idx) => {
       const dirs = [
@@ -1177,7 +1356,7 @@ export default function App() {
         (d) => MAZE_GRID[cell.r + d.dr] && MAZE_GRID[cell.r + d.dr][cell.c + d.dc] === 1
       );
 
-      if (validWalls.length > 0 && idx % 2 === 0) {
+      if (validWalls.length > 0 && idx % 3 === 0) {
         const chosen = validWalls[idx % validWalls.length];
         const enemyMesh = createWallCyborgMesh();
         const wallSurfaceOffset = CELL_SIZE / 2 - 0.55;
@@ -1686,6 +1865,16 @@ export default function App() {
 
           // Check maze walls & platforms
           if (!hit) {
+            for (const prism of g.wallPrisms) {
+              if (r.pos.y < prism.minY || r.pos.y > prism.maxY) continue;
+              const c = prismContact(prism, r.pos.x, r.pos.z, 0);
+              if (c && c.dist <= 0) {
+                hit = true;
+                break;
+              }
+            }
+          }
+          if (!hit) {
             for (const box of g.staticColliders) {
               if (
                 r.pos.x >= box.minX &&
@@ -1923,6 +2112,19 @@ export default function App() {
           }
         }
 
+        for (const prism of g.wallPrisms) {
+          const feetY = p.pos.y - eyeOffset;
+          if (p.vel.y > 0 || feetY > prism.maxY || feetY < prism.maxY - 2.2) continue;
+          const c = prismContact(prism, p.pos.x, p.pos.z, p.radius);
+          if (c && c.dist < p.radius) {
+            p.pos.y = prism.maxY + eyeOffset;
+            p.vel.y = 0;
+            p.grounded = true;
+            p.wallrunning = false;
+            p.canDoubleJump = true;
+          }
+        }
+
         // Move XZ and detect Wallrunning Contacts
         p.pos.x += p.vel.x * dt;
         p.pos.z += p.vel.z * dt;
@@ -1980,6 +2182,27 @@ export default function App() {
               else if (minD === dFront) touchedWallNormal = new THREE.Vector3(0, 0, -1);
               else touchedWallNormal = new THREE.Vector3(0, 0, 1);
             }
+          }
+        }
+
+        for (const prism of g.wallPrisms) {
+          const feetY = p.pos.y - eyeOffset;
+          if (!(p.pos.y > prism.minY + 0.5 && feetY < prism.maxY - 0.4)) continue;
+          const c = prismContact(prism, p.pos.x, p.pos.z, detectRadius);
+          if (!c) continue;
+          if (c.dist < p.radius) {
+            // Push out and drop the velocity going into the wall (keeps the sliding part)
+            const push = p.radius - c.dist;
+            p.pos.x += c.nx * push;
+            p.pos.z += c.nz * push;
+            const into = p.vel.x * c.nx + p.vel.z * c.nz;
+            if (into < 0) {
+              p.vel.x -= c.nx * into;
+              p.vel.z -= c.nz * into;
+            }
+            touchedWallNormal = new THREE.Vector3(c.nx, 0, c.nz);
+          } else if (!touchedWallNormal) {
+            touchedWallNormal = new THREE.Vector3(c.nx, 0, c.nz);
           }
         }
 
@@ -2059,7 +2282,7 @@ export default function App() {
       } else {
         // Orbit preview camera gently when in Menu
         const t = performance.now() * 0.0003;
-        camera.position.set(Math.cos(t) * 38, 28, Math.sin(t) * 38);
+        camera.position.set(Math.cos(t) * 60, 48, Math.sin(t) * 60);
         camera.lookAt(0, 6, 0);
       }
 
