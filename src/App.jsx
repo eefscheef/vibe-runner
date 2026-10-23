@@ -513,6 +513,79 @@ function createGridTexture(bg, lineColor, accentColor) {
 // ==========================================
 // MAIN COMPONENT
 // ==========================================
+// ==========================================
+// SESSION SPEEDRUN LEADERBOARD
+// ==========================================
+// Each pilot's best run per category, top 10 (same rules as server.js)
+function bestPerPilot(runs, better) {
+  const best = new Map();
+  for (const run of runs) {
+    const cur = best.get(run.name);
+    if (!cur || better(run, cur) < 0) best.set(run.name, run);
+  }
+  return [...best.values()].sort(better).slice(0, 10);
+}
+
+function rankRuns(runs) {
+  return {
+    fastest: bestPerPilot(runs, (a, b) => a.time - b.time),
+    score: bestPerPilot(runs, (a, b) => b.score - a.score || a.time - b.time),
+  };
+}
+
+function formatRunTime(seconds) {
+  if (seconds < 60) return `${seconds.toFixed(2)}s`;
+  const m = Math.floor(seconds / 60);
+  const s = (seconds - m * 60).toFixed(2).padStart(5, '0');
+  return `${m}:${s}`;
+}
+
+function LeaderboardPanel({ board, me }) {
+  const columns = [
+    { key: 'score', title: 'Score + Time', note: 'Highest score, faster time breaks ties' },
+    { key: 'fastest', title: 'Fastest Time', note: 'Least time to the exit beacon' },
+  ];
+  return (
+    <div className="w-full max-w-lg bg-slate-900/95 border border-slate-800 rounded-2xl p-5 shadow-2xl text-left">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="text-sm font-black uppercase tracking-widest text-yellow-300 flex items-center gap-2">
+          <Award className="w-4 h-4" /> Session Leaderboard
+        </h3>
+        <span className="text-[10px] uppercase text-slate-500 font-bold">
+          {board.shared ? `Room ${board.room || ''}` : 'This browser only'}
+        </span>
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        {columns.map((col) => (
+          <div key={col.key}>
+            <div className="text-xs font-bold uppercase text-cyan-300">{col.title}</div>
+            <div className="text-[10px] text-slate-500 mb-1.5">{col.note}</div>
+            {board[col.key].length === 0 ? (
+              <div className="text-xs text-slate-500 italic py-2">No finished runs yet</div>
+            ) : (
+              <ol className="space-y-0.5 text-xs font-mono">
+                {board[col.key].map((run, i) => (
+                  <li
+                    key={run.name}
+                    className={`flex items-center gap-2 px-2 py-1 rounded ${
+                      run.name === me ? 'bg-cyan-500/15 text-cyan-200' : 'text-slate-300'
+                    }`}
+                  >
+                    <span className={`w-5 ${i === 0 ? 'text-yellow-300 font-black' : 'text-slate-500'}`}>{i + 1}.</span>
+                    <span className="flex-1 truncate">{run.name}</span>
+                    {col.key === 'score' && <span className="text-yellow-300">{run.score}</span>}
+                    <span className="text-white w-16 text-right">{formatRunTime(run.time)}</span>
+                  </li>
+                ))}
+              </ol>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   const mountRef = useRef(null);
 
@@ -546,6 +619,8 @@ export default function App() {
   const [zipStatus, setZipStatus] = useState('');
   const [showControlsModal, setShowControlsModal] = useState(false);
   const [showMultiplayerModal, setShowMultiplayerModal] = useState(false);
+  const [leaderboard, setLeaderboard] = useState({ fastest: [], score: [], shared: false });
+  const [showBoardHotkey, setShowBoardHotkey] = useState(false); // hold Tab while playing
 
   // Multiplayer State (Supports Both Live Preview Room Sync & Local WiFi WebSocket LAN)
   const [user, setUser] = useState(null);
@@ -612,12 +687,36 @@ export default function App() {
     score: 0,
     remotePlayers: {}, // { [peerId]: { data, mesh } }
     pilotKills: 0,
+    localRuns: [], // finished runs in this browser session (used when offline)
+    pilotName: '',
     spawnProtect: 0, // seconds of immunity to other pilots after deploying
     netSend: null, // set by the multiplayer effect while connected
     netHandlers: {}, // ROCKET / HIT / KILLED handlers, set by the game engine
     ws: null,
     localPeerId: `peer_${Math.random().toString(36).substring(2, 9)}`,
   });
+
+  useEffect(() => {
+    gameRef.current.pilotName = pilotName;
+  }, [pilotName]);
+
+  // Hold Tab to peek at the leaderboard mid-run
+  useEffect(() => {
+    const down = (e) => {
+      if (e.code !== 'Tab' || e.target instanceof HTMLInputElement) return; // keep Tab working in text fields
+      e.preventDefault();
+      setShowBoardHotkey(true);
+    };
+    const up = (e) => {
+      if (e.code === 'Tab') setShowBoardHotkey(false);
+    };
+    window.addEventListener('keydown', down);
+    window.addEventListener('keyup', up);
+    return () => {
+      window.removeEventListener('keydown', down);
+      window.removeEventListener('keyup', up);
+    };
+  }, []);
 
   // Multiplayer over WebSocket.
   // CLOUD_ROOM = the server that is hosting this page (auto address); WIFI_WS = a typed-in address.
@@ -641,6 +740,7 @@ export default function App() {
         g.ws = null;
       }
       clearPeers();
+      setLeaderboard({ ...rankRuns(g.localRuns), shared: false });
       return;
     }
 
@@ -1262,6 +1362,15 @@ export default function App() {
 
     // Multiplayer events from other pilots
     g.netHandlers = {
+      // The server's leaderboard for our room
+      LEADERBOARD: (msg) => {
+        setLeaderboard({
+          fastest: Array.isArray(msg.fastest) ? msg.fastest : [],
+          score: Array.isArray(msg.score) ? msg.score : [],
+          shared: true,
+          room: msg.room,
+        });
+      },
       // Another pilot fired: show their rocket (it can push us, but only its owner decides kills)
       ROCKET: (msg) => {
         if (g.state !== 'PLAYING') return;
@@ -1795,6 +1904,18 @@ export default function App() {
               if (box.isExit) {
                 g.state = 'WON';
                 setGameState('WON');
+                const run = {
+                  name: g.pilotName || 'PILOT',
+                  time: Math.round(g.elapsedTime * 100) / 100,
+                  score: g.score,
+                };
+                g.localRuns.push(run);
+                setHud((h) => ({ ...h, elapsedTime: run.time, score: run.score }));
+                if (g.netSend) {
+                  g.netSend({ type: 'RUN_FINISHED', time: run.time, score: run.score });
+                } else {
+                  setLeaderboard({ ...rankRuns(g.localRuns), shared: false });
+                }
                 sfx.playVictory();
                 safeExitPointerLock();
               }
@@ -1924,7 +2045,7 @@ export default function App() {
             doubleJumpReady: p.canDoubleJump,
             slideBoostCooldown: p.slideBoostCooldown,
             distanceToExit: dist,
-            elapsedTime: Number(g.elapsedTime.toFixed(1)),
+            elapsedTime: Math.round(g.elapsedTime * 100) / 100,
             platformAlert: g.nextPlatformSpawnTimer < 0.7,
             activePlatforms: activePlatCount,
             kills: g.kills,
@@ -2229,6 +2350,9 @@ export default function App() {
               <div className="px-3 py-1.5 rounded-lg text-xs font-bold bg-orange-950/80 border border-orange-500/50 text-orange-300">
                 LMB: FIRE BAZOOKA
               </div>
+              <div className="px-3 py-1.5 rounded-lg text-xs font-bold bg-yellow-950/80 border border-yellow-500/50 text-yellow-300">
+                TAB: LEADERBOARD
+              </div>
             </div>
           </div>
 
@@ -2280,7 +2404,7 @@ export default function App() {
       {/* OVERLAY MENUS (START, PAUSE, VICTORY, LOSS) */}
       {/* ========================================== */}
       {gameState !== 'PLAYING' && (
-        <div className="absolute inset-0 z-20 flex items-center justify-center bg-slate-950/75 backdrop-blur-md p-6">
+        <div className="absolute inset-0 z-20 flex flex-col lg:flex-row items-center justify-center gap-6 bg-slate-950/75 backdrop-blur-md p-6 pt-24 lg:pt-6 overflow-y-auto">
           <div className="max-w-lg w-full bg-slate-900/95 border border-slate-800 rounded-2xl p-7 shadow-2xl text-center relative overflow-hidden">
             <div className="absolute -top-24 -left-24 w-48 h-48 bg-cyan-500/20 rounded-full blur-3xl pointer-events-none" />
             <div className="absolute -bottom-24 -right-24 w-48 h-48 bg-orange-500/20 rounded-full blur-3xl pointer-events-none" />
@@ -2320,7 +2444,7 @@ export default function App() {
                 <div className="grid grid-cols-4 gap-2 mb-6 bg-slate-950/90 p-3.5 rounded-xl border border-slate-800">
                   <div>
                     <div className="text-[10px] text-slate-400 uppercase">Clear Time</div>
-                    <div className="text-lg font-black font-mono text-white">{hud.elapsedTime}s</div>
+                    <div className="text-lg font-black font-mono text-white">{formatRunTime(hud.elapsedTime)}</div>
                   </div>
                   <div>
                     <div className="text-[10px] text-slate-400 uppercase">Top Speed</div>
@@ -2399,6 +2523,13 @@ export default function App() {
 
             </div>
           </div>
+          <LeaderboardPanel board={leaderboard} me={pilotName} />
+        </div>
+      )}
+
+      {gameState === 'PLAYING' && showBoardHotkey && (
+        <div className="absolute inset-0 z-30 flex items-center justify-center pointer-events-none p-6">
+          <LeaderboardPanel board={leaderboard} me={pilotName} />
         </div>
       )}
 
