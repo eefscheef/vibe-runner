@@ -1832,14 +1832,20 @@ export default function App() {
     animate();
 
     // Responsive Resize Handler
+    // Follows the container's real size, so the view fixes itself if styles arrive late.
     const handleResize = () => {
       if (!container) return;
-      camera.aspect = container.clientWidth / container.clientHeight;
+      const w = container.clientWidth || window.innerWidth;
+      const h = container.clientHeight || window.innerHeight;
+      camera.aspect = w / h;
       camera.updateProjectionMatrix();
-      renderer.setSize(container.clientWidth, container.clientHeight);
+      renderer.setSize(w, h);
     };
 
+    handleResize();
     window.addEventListener('resize', handleResize);
+    const resizeObserver = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(handleResize) : null;
+    resizeObserver?.observe(container);
 
     return () => {
       cancelAnimationFrame(animationFrameId);
@@ -1850,6 +1856,7 @@ export default function App() {
       document.removeEventListener('pointerlockchange', onPointerLockChange);
       document.removeEventListener('pointerlockerror', onPointerLockError);
       window.removeEventListener('resize', handleResize);
+      resizeObserver?.disconnect();
     };
   }, [triggerKillPopup, safeRequestPointerLock, safeExitPointerLock]);
 
