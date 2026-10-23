@@ -23,6 +23,7 @@ Push this folder to a GitHub repository, then on render.com choose **New → Blu
 1. Open the link (host: `localhost`, friends: the `Friends (LAN)` link).
 2. Click **WiFi / Co-op Lobby** → **Option 1: Host's Server**.
 3. Use the same **Room Code** (default `WIFI-1`), then launch the run.
+4. Rockets hit other pilots too: a hit sends them back to the start. New spawns get 2 seconds of protection.
 
 ## Troubleshooting
 - **Friend's browser can't open the link:** you must be on the same WiFi/network, and the host's

@@ -540,6 +540,7 @@ export default function App() {
     score: 0,
   });
   const [killPopups, setKillPopups] = useState([]);
+  const [deathCause, setDeathCause] = useState(null); // name of the pilot who fragged you, or null for lava
   const [muted, setMuted] = useState(false);
   const [zipGenerating, setZipGenerating] = useState(false);
   const [zipStatus, setZipStatus] = useState('');
@@ -610,6 +611,10 @@ export default function App() {
     streakTimer: 0,
     score: 0,
     remotePlayers: {}, // { [peerId]: { data, mesh } }
+    pilotKills: 0,
+    spawnProtect: 0, // seconds of immunity to other pilots after deploying
+    netSend: null, // set by the multiplayer effect while connected
+    netHandlers: {}, // ROCKET / HIT / KILLED handlers, set by the game engine
     ws: null,
     localPeerId: `peer_${Math.random().toString(36).substring(2, 9)}`,
   });
@@ -673,8 +678,13 @@ export default function App() {
           refreshList();
           return;
         }
-        if (msg.type !== 'STATE_UPDATE' || msg.id === g.localPeerId) return;
+        if (msg.id === g.localPeerId) return;
         if ((msg.room || '').toUpperCase() !== room) return;
+        if (msg.type !== 'STATE_UPDATE') {
+          const handler = g.netHandlers[msg.type];
+          if (handler) handler(msg);
+          return;
+        }
         if (!g.remotePlayers[msg.id]) {
           g.remotePlayers[msg.id] = { data: msg, mesh: null, lastSeen: Date.now() };
         } else {
@@ -699,6 +709,12 @@ export default function App() {
       };
     };
     connect();
+
+    g.netSend = (obj) => {
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ ...obj, id: g.localPeerId, room, name: pilotName }));
+      }
+    };
 
     const wsInterval = setInterval(() => {
       // Drop pilots we have not heard from in 5s (uses our own clock, so PC clock differences don't matter)
@@ -729,6 +745,8 @@ export default function App() {
             score: g.score,
             kills: g.kills,
             streak: g.streak,
+            pilotKills: g.pilotKills,
+            alive: g.state === 'PLAYING',
             updatedAt: Date.now(),
           })
         );
@@ -737,6 +755,7 @@ export default function App() {
 
     return () => {
       closedByUs = true;
+      g.netSend = null;
       clearTimeout(retryTimer);
       clearInterval(wsInterval);
       if (socket) socket.close();
@@ -772,15 +791,17 @@ export default function App() {
   }, []);
 
   // Trigger prominent "NERD KILLED" arcade popup with streak badge
-  const triggerKillPopup = useCallback((streakCount, multiKillIndex = 0) => {
+  const triggerKillPopup = useCallback((streakCount, multiKillIndex = 0, opts = {}) => {
     const id = Date.now() + Math.random();
-    const bonusPoints = 150 * streakCount;
+    const bonusPoints = opts.points ?? 150 * streakCount;
     setKillPopups((prev) => [
       ...prev.slice(-4),
       {
         id,
         streak: streakCount,
         points: bonusPoints,
+        label: opts.label || 'NERD KILLED!',
+        subtitle: opts.subtitle || `STREAK x${streakCount}`,
         offsetX: (Math.random() - 0.5) * 90,
         offsetY: multiKillIndex * -44,
       },
@@ -813,9 +834,12 @@ export default function App() {
     g.streak = 0;
     g.streakTimer = 0;
     g.score = 0;
+    g.pilotKills = 0;
+    g.spawnProtect = 2.0;
     g.fireCooldown = 0;
     g.bazookaRecoil = 0;
     setKillPopups([]);
+    setDeathCause(null);
 
     // Reset dynamic rising platforms
     g.risingPlatforms.forEach((p) => {
@@ -1170,6 +1194,19 @@ export default function App() {
         .addScaledVector(right, 0.32);
       spawnPos.y -= 0.18;
 
+      const vel = forward.clone().multiplyScalar(68);
+      spawnRocket(spawnPos, vel, null);
+      if (g.netSend) {
+        g.netSend({
+          type: 'ROCKET',
+          px: +spawnPos.x.toFixed(2), py: +spawnPos.y.toFixed(2), pz: +spawnPos.z.toFixed(2),
+          vx: +vel.x.toFixed(2), vy: +vel.y.toFixed(2), vz: +vel.z.toFixed(2),
+        });
+      }
+    };
+
+    // Creates a rocket. owner = null for our own rockets, or the peer id of the pilot who fired it.
+    const spawnRocket = (spawnPos, vel, owner) => {
       const rocketGroup = new THREE.Group();
       const warhead = new THREE.Mesh(
         new THREE.SphereGeometry(0.24, 10, 10),
@@ -1186,15 +1223,81 @@ export default function App() {
       rocketGroup.add(tail);
 
       rocketGroup.position.copy(spawnPos);
-      rocketGroup.lookAt(spawnPos.clone().add(forward));
+      rocketGroup.lookAt(spawnPos.clone().add(vel));
       scene.add(rocketGroup);
 
       g.rockets.push({
         mesh: rocketGroup,
         pos: spawnPos,
-        vel: forward.multiplyScalar(68),
+        vel,
         life: 3.5,
+        owner,
       });
+    };
+
+    // Body centre of a remote pilot (their synced position is eye height)
+    const remotePilotCentre = (rp) => rp.mesh.position.clone().add(new THREE.Vector3(0, -1.0, 0));
+    const isRemotePilotAlive = (rp) => rp && rp.mesh && rp.data && rp.data.alive !== false;
+
+    const spawnShatter = (pos, accentColor) => {
+      for (let i = 0; i < 12; i++) {
+        const isAccent = i % 3 === 0;
+        const shard = new THREE.Mesh(
+          new THREE.BoxGeometry(0.32, 0.32, 0.32),
+          new THREE.MeshBasicMaterial({ color: isAccent ? accentColor : 0xf8fafc })
+        );
+        shard.position.copy(pos);
+        scene.add(shard);
+        g.shatterDebris.push({
+          mesh: shard,
+          vel: new THREE.Vector3(
+            (Math.random() - 0.5) * 24,
+            Math.random() * 16 + 4,
+            (Math.random() - 0.5) * 24
+          ),
+          life: 1.1,
+        });
+      }
+    };
+
+    // Multiplayer events from other pilots
+    g.netHandlers = {
+      // Another pilot fired: show their rocket (it can push us, but only its owner decides kills)
+      ROCKET: (msg) => {
+        if (g.state !== 'PLAYING') return;
+        spawnRocket(
+          new THREE.Vector3(msg.px, msg.py, msg.pz),
+          new THREE.Vector3(msg.vx, msg.vy, msg.vz),
+          msg.id
+        );
+      },
+      // Another pilot's rocket caught us
+      HIT: (msg) => {
+        if (msg.target !== g.localPeerId || g.state !== 'PLAYING' || g.spawnProtect > 0) return;
+        g.state = 'LOST';
+        setGameState('LOST');
+        setDeathCause(msg.name || 'ANOTHER PILOT');
+        sfx.playExplosion(true, 1);
+        safeExitPointerLock();
+        if (g.netSend) g.netSend({ type: 'KILLED', by: msg.id });
+      },
+      // A pilot died to someone's rocket (maybe ours)
+      KILLED: (msg) => {
+        const rp = g.remotePlayers[msg.id];
+        if (rp && rp.mesh) {
+          spawnShatter(remotePilotCentre(rp), 0x00f0ff);
+          if (rp.data) rp.data.alive = false;
+          rp.mesh.visible = false;
+        }
+        if (msg.by === g.localPeerId) {
+          g.pilotKills += 1;
+          g.streak += 1;
+          g.streakTimer = 6.5;
+          g.score += 500;
+          triggerKillPopup(g.streak, 0, { label: 'PILOT KILLED!', subtitle: msg.name || 'PILOT', points: 500 });
+          sfx.playExplosion(true, g.streak);
+        }
+      },
     };
 
     // 8. Input Listeners (Keyboard + Mouse Look + Left-Click Rocket Fire)
@@ -1313,7 +1416,7 @@ export default function App() {
     };
 
     // Explode Rocket & Check Cyborg Enemy Hits + Rocket Jump Knockback
-    const triggerRocketExplosion = (impactPos) => {
+    const triggerRocketExplosion = (impactPos, owner = null) => {
       const expMesh = new THREE.Mesh(
         new THREE.SphereGeometry(1, 16, 16),
         new THREE.MeshBasicMaterial({
@@ -1330,32 +1433,25 @@ export default function App() {
       const blastRadius = 7.2;
       let hitCountThisShot = 0;
 
+      // Rockets from other pilots are visual only here; their own game decides what they hit
+      if (!owner) {
+        Object.entries(g.remotePlayers).forEach(([peerId, rp]) => {
+          if (!isRemotePilotAlive(rp)) return;
+          if (remotePilotCentre(rp).distanceTo(impactPos) <= 6.0 && g.netSend) {
+            g.netSend({ type: 'HIT', target: peerId });
+          }
+        });
+      }
+
       g.enemies.forEach((enemy) => {
-        if (!enemy.alive) return;
+        if (owner || !enemy.alive) return;
         const dist = enemy.mesh.position.distanceTo(impactPos);
         if (dist <= blastRadius) {
           enemy.alive = false;
           enemy.mesh.visible = false;
 
           // Spawn shatter debris (white hoodie + cyan cyber shards)
-          for (let i = 0; i < 12; i++) {
-            const isCyan = i % 3 === 0;
-            const shard = new THREE.Mesh(
-              new THREE.BoxGeometry(0.32, 0.32, 0.32),
-              new THREE.MeshBasicMaterial({ color: isCyan ? 0x00f0ff : 0xf8fafc })
-            );
-            shard.position.copy(enemy.mesh.position);
-            scene.add(shard);
-            g.shatterDebris.push({
-              mesh: shard,
-              vel: new THREE.Vector3(
-                (Math.random() - 0.5) * 24,
-                Math.random() * 16 + 4,
-                (Math.random() - 0.5) * 24
-              ),
-              life: 1.1,
-            });
-          }
+          spawnShatter(enemy.mesh.position, 0x00f0ff);
 
           g.kills += 1;
           g.streak += 1;
@@ -1408,6 +1504,7 @@ export default function App() {
           }
         }
         if (g.fireCooldown > 0) g.fireCooldown -= dt;
+        if (g.spawnProtect > 0) g.spawnProtect -= dt;
         if (g.bazookaRecoil > 0) g.bazookaRecoil = Math.max(0, g.bazookaRecoil - dt * 4.5);
 
         // Streak Decay Timer
@@ -1440,6 +1537,7 @@ export default function App() {
         // Update Active Rockets & Collision Detection
         for (let i = g.rockets.length - 1; i >= 0; i--) {
           const r = g.rockets[i];
+          const prevPos = r.pos.clone();
           r.pos.addScaledVector(r.vel, dt);
           r.mesh.position.copy(r.pos);
           r.life -= dt;
@@ -1449,8 +1547,25 @@ export default function App() {
             hit = true;
           }
 
-          // Check direct proximity to cyborg enemies
+          // Direct hits on pilots: our rockets vs other pilots, their rockets vs us (visual)
           if (!hit) {
+            // Check the whole path flown this frame so fast rockets can't skip past a pilot
+            const flown = new THREE.Line3(prevPos, r.pos);
+            const pathDist = (pt) => flown.closestPointToPoint(pt, true, new THREE.Vector3()).distanceTo(pt);
+            if (r.owner) {
+              if (pathDist(p.pos.clone().add(new THREE.Vector3(0, -1.0, 0))) < 2.0) hit = true;
+            } else {
+              for (const rp of Object.values(g.remotePlayers)) {
+                if (isRemotePilotAlive(rp) && pathDist(remotePilotCentre(rp)) < 2.0) {
+                  hit = true;
+                  break;
+                }
+              }
+            }
+          }
+
+          // Check direct proximity to cyborg enemies
+          if (!hit && !r.owner) {
             for (const enemy of g.enemies) {
               if (!enemy.alive) continue;
               if (r.pos.distanceTo(enemy.mesh.position) < 2.25) {
@@ -1478,7 +1593,7 @@ export default function App() {
           }
 
           if (hit) {
-            triggerRocketExplosion(r.pos.clone());
+            triggerRocketExplosion(r.pos.clone(), r.owner);
             scene.remove(r.mesh);
             g.rockets.splice(i, 1);
           }
@@ -1519,10 +1634,11 @@ export default function App() {
             rp.mesh = createRemotePilotMesh(0x00f0ff);
             scene.add(rp.mesh);
           }
-          rp.mesh.position.lerp(
-            new THREE.Vector3(rp.data.x || 0, rp.data.y || 5, rp.data.z || 0),
-            12 * dt
-          );
+          const target = new THREE.Vector3(rp.data.x || 0, rp.data.y || 5, rp.data.z || 0);
+          // Snap on big jumps (respawn), smooth otherwise
+          if (rp.mesh.position.distanceTo(target) > 20) rp.mesh.position.copy(target);
+          else rp.mesh.position.lerp(target, 12 * dt);
+          rp.mesh.visible = rp.data.alive !== false;
           rp.mesh.rotation.y = rp.data.yaw || 0;
           rp.mesh.rotation.z = rp.data.roll || 0;
         });
@@ -1965,10 +2081,10 @@ export default function App() {
                   <Skull className="w-7 h-7 text-yellow-300 animate-spin" style={{ animationDuration: '1.5s' }} />
                   <div className="text-center">
                     <div className="text-2xl md:text-3xl font-black italic tracking-wider text-white drop-shadow-[0_2px_4px_rgba(0,0,0,0.9)]">
-                      NERD KILLED!
+                      {popup.label}
                     </div>
                     <div className="flex items-center justify-center gap-2 text-xs font-extrabold uppercase tracking-widest text-yellow-200">
-                      <span>STREAK x{popup.streak}</span>
+                      <span>{popup.subtitle}</span>
                       <span>•</span>
                       <span>+{popup.points} PTS</span>
                     </div>
@@ -2227,9 +2343,13 @@ export default function App() {
                 <div className="w-14 h-14 rounded-2xl bg-rose-500/20 border border-rose-500/40 text-rose-400 flex items-center justify-center mx-auto mb-4">
                   <ShieldAlert className="w-8 h-8" />
                 </div>
-                <h2 className="text-3xl font-black text-rose-400 mb-1">CONSUMED BY MAGMA</h2>
+                <h2 className="text-3xl font-black text-rose-400 mb-1">
+                  {deathCause ? `FRAGGED BY ${deathCause}` : 'CONSUMED BY MAGMA'}
+                </h2>
                 <p className="text-sm text-slate-300 mb-5">
-                  Stay high on the labyrinth walls, rocket-jump or chain wall-kicks, and use erupting cyan boost pillars!
+                  {deathCause
+                    ? 'Keep moving, stay off their line of fire, and rocket them back!'
+                    : 'Stay high on the labyrinth walls, rocket-jump or chain wall-kicks, and use erupting cyan boost pillars!'}
                 </p>
                 <div className="grid grid-cols-3 gap-2 mb-6 bg-slate-950/90 p-3.5 rounded-xl border border-slate-800">
                   <div>
